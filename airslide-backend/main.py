@@ -178,20 +178,20 @@ class VisionManager:
         self._opencv_error: Optional[str] = None
         self._mediapipe_error: Optional[str] = None
         self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
-        self.swipe_threshold = 0.02
+        self.swipe_threshold = 0.10
         self.confidence_threshold = 0.45
-        self._minimum_swipe_duration = 0.22
-        self._maximum_swipe_duration = 0.9
-        self._maximum_vertical_drift = 0.08
-        self._minimum_swipe_velocity = 0.06
-        self._minimum_step_delta = 0.004
-        self._minimum_start_step_delta = 0.006
-        self._minimum_peak_step_delta = 0.008
+        self._minimum_swipe_duration = 0.12
+        self._maximum_swipe_duration = 2.4
+        self._maximum_vertical_drift = 0.32
+        self._minimum_swipe_velocity = 0.045
+        self._minimum_step_delta = 0.0025
+        self._minimum_start_step_delta = 0.003
+        self._minimum_peak_step_delta = 0.004
         self._minimum_directional_steps = 2
-        self._minimum_swipe_directness = 0.72
-        self._page_turn_settle_seconds = 0.18
+        self._minimum_swipe_directness = 0.45
+        self._page_turn_settle_seconds = 0.08
         self._page_turn_hold_grace_seconds = 0.45
-        self._page_turn_arm_timeout = 2.2
+        self._page_turn_arm_timeout = 3.0
 
         try:
             import cv2
@@ -563,7 +563,7 @@ class VisionManager:
                 "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
             }
 
-        tracking_hand = landmark_hand
+        tracking_hand = motion_hand or landmark_hand or hand
         if tracking_hand is None:
             self._histories[client_id].clear()
             self._page_turn_armed[client_id] = False
@@ -681,6 +681,7 @@ class VisionManager:
             "pageTurnHoldProgress": round(hold_progress, 2),
             "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
             "pageTurnArmed": self._page_turn_armed[client_id],
+            "pageTurnTrackingSource": tracking_hand.get("source"),
             "pageTurnSwipeDirection": swipe_direction,
             "pageTurnSwipeDelta": swipe_delta,
             "pageTurnSwipeVelocity": swipe_velocity,
@@ -731,7 +732,7 @@ class VisionManager:
         if settings.cooldownSeconds is not None:
             self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
         if settings.swipeThreshold is not None:
-            self.swipe_threshold = min(0.08, max(0.005, settings.swipeThreshold))
+            self.swipe_threshold = min(0.5, max(0.005, settings.swipeThreshold))
         if settings.confidenceThreshold is not None:
             self.confidence_threshold = min(0.95, max(0.2, settings.confidenceThreshold))
         return self.settings()
