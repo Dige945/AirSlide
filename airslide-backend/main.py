@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import json
 import os
 import platform
 import re
 import shutil
 import subprocess
-import wave
 import textwrap
 import time
 import uuid
@@ -37,8 +35,8 @@ PRESENTATIONS_DIR = STORAGE_DIR / "presentations"
 ALLOWED_EXTENSIONS = {".ppt", ".pptx"}
 EXPORT_WIDTH = 1920
 EXPORT_HEIGHT = 1080
-PAGE_TURN_COOLDOWN_SECONDS = 5.0
-PAGE_TURN_HOLD_SECONDS = 1.0
+PAGE_TURN_COOLDOWN_SECONDS = 1.6
+PAGE_TURN_HOLD_SECONDS = 0.65
 
 STORAGE_DIR.mkdir(exist_ok=True)
 PRESENTATIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,11 +80,6 @@ class VoiceRecognitionPayload(BaseModel):
     showEndConfirm: bool = False
 
 
-class VoiceAudioPayload(BaseModel):
-    data: str
-    showEndConfirm: bool = False
-
-
 class VoiceCommandPattern(BaseModel):
     action: str
     label: str
@@ -95,79 +88,14 @@ class VoiceCommandPattern(BaseModel):
     patterns: List[str] = []
 
 
-class VoiceTranscriber:
-    def __init__(self) -> None:
-        self.model_dir = BASE_DIR / "models" / "vosk-model-small-cn-0.22"
-        self.runtime_model_dir = self.model_dir
-        self._model: Any = None
-        self._error: Optional[str] = None
-
-    def _load_model(self) -> Any:
-        if self._model is not None:
-            return self._model
-        if not self.model_dir.exists():
-            raise RuntimeError(f"Vosk model not found: {self.model_dir}")
-        try:
-            from vosk import Model
-
-            self.runtime_model_dir = self._prepare_runtime_model_dir()
-            self._model = Model(str(self.runtime_model_dir))
-            self._error = None
-            return self._model
-        except Exception as exc:
-            self._error = str(exc)
-            raise
-
-    def _prepare_runtime_model_dir(self) -> Path:
-        safe_root = Path(os.environ.get("TEMP", str(BASE_DIR / "storage"))) / "airslide-vosk"
-        safe_model_dir = safe_root / self.model_dir.name
-        if not safe_model_dir.exists():
-            shutil.copytree(self.model_dir, safe_model_dir)
-        return safe_model_dir
-
-    def transcribe_wav(self, audio: bytes) -> Dict[str, Any]:
-        model = self._load_model()
-        try:
-            from vosk import KaldiRecognizer
-
-            with wave.open(io.BytesIO(audio), "rb") as wav:
-                channels = wav.getnchannels()
-                sample_width = wav.getsampwidth()
-                sample_rate = wav.getframerate()
-                if channels != 1 or sample_width != 2:
-                    raise ValueError("请上传 16-bit 单声道 WAV 音频")
-
-                recognizer = KaldiRecognizer(model, sample_rate)
-                recognizer.SetWords(False)
-                while True:
-                    chunk = wav.readframes(4000)
-                    if not chunk:
-                        break
-                    recognizer.AcceptWaveform(chunk)
-
-            result = json.loads(recognizer.FinalResult())
-            text = str(result.get("text", "")).replace(" ", "").strip()
-            return {
-                "text": text,
-                "sampleRate": sample_rate,
-                "error": None,
-                "model": self.model_dir.name,
-            }
-        except Exception as exc:
-            self._error = str(exc)
-            return {
-                "text": "",
-                "sampleRate": None,
-                "error": str(exc),
-                "model": self.model_dir.name,
-            }
-
-
 class VisionManager:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._histories: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(
             lambda: deque(maxlen=12)
+        )
+        self._direct_swipe_histories: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(
+            lambda: deque(maxlen=8)
         )
         self._previous_frames: Dict[str, Any] = {}
         self._last_action_at: Dict[str, float] = defaultdict(float)
@@ -178,20 +106,21 @@ class VisionManager:
         self._opencv_error: Optional[str] = None
         self._mediapipe_error: Optional[str] = None
         self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
-        self.swipe_threshold = 0.10
+        self.swipe_threshold = 0.045
         self.confidence_threshold = 0.45
-        self._minimum_swipe_duration = 0.12
-        self._maximum_swipe_duration = 2.4
-        self._maximum_vertical_drift = 0.32
-        self._minimum_swipe_velocity = 0.045
-        self._minimum_step_delta = 0.0025
-        self._minimum_start_step_delta = 0.003
-        self._minimum_peak_step_delta = 0.004
-        self._minimum_directional_steps = 2
-        self._minimum_swipe_directness = 0.45
-        self._page_turn_settle_seconds = 0.08
-        self._page_turn_hold_grace_seconds = 0.45
-        self._page_turn_arm_timeout = 3.0
+        self._minimum_swipe_duration = 0.05
+        self._maximum_swipe_duration = 2.6
+        self._maximum_vertical_drift = 0.45
+        self._minimum_swipe_velocity = 0.018
+        self._minimum_step_delta = 0.0008
+        self._minimum_directional_steps = 1
+        self._minimum_swipe_directness = 0.18
+        self._direct_swipe_threshold = 0.12
+        self._direct_swipe_min_velocity = 0.14
+        self._direct_swipe_directness = 0.34
+        self._page_turn_settle_seconds = 0.0
+        self._page_turn_hold_grace_seconds = 1.0
+        self._page_turn_arm_timeout = 5.0
 
         try:
             import cv2
@@ -247,8 +176,8 @@ class VisionManager:
                 static_image_mode=False,
                 max_num_hands=1,
                 model_complexity=0,
-                min_detection_confidence=0.55,
-                min_tracking_confidence=0.5,
+                min_detection_confidence=0.45,
+                min_tracking_confidence=0.45,
             )
         except Exception as exc:
             self.mp_hands = None
@@ -482,6 +411,63 @@ class VisionManager:
         upward_extension = tip.y < mcp.y - 0.035
         return lateral_extension or upward_extension
 
+    def _detect_swipe_action(
+        self,
+        history: Deque[Tuple[float, float, float]],
+        threshold: float,
+        min_velocity: float,
+        min_directness: float,
+    ) -> Tuple[Optional[str], Optional[str], Optional[float], Optional[float]]:
+        if len(history) < 2:
+            return None, None, None, None
+
+        points = list(history)
+        best: Optional[Tuple[str, str, float, float, float]] = None
+        for start in range(0, len(points) - 1):
+            first_time, first_x, first_y = points[start]
+            last_time, last_x, last_y = points[-1]
+            dx = last_x - first_x
+            dy = abs(last_y - first_y)
+            duration = max(last_time - first_time, 0.001)
+            if duration < self._minimum_swipe_duration or duration > self._maximum_swipe_duration:
+                continue
+            if abs(dx) <= threshold or dy >= self._maximum_vertical_drift:
+                continue
+
+            step_deltas = [
+                points[index][1] - points[index - 1][1]
+                for index in range(start + 1, len(points))
+            ]
+            horizontal_path = sum(abs(delta) for delta in step_deltas)
+            directness = abs(dx) / max(horizontal_path, 0.001)
+            velocity = abs(dx) / duration
+            if velocity < min_velocity or directness < min_directness:
+                continue
+
+            direction_sign = 1 if dx > 0 else -1
+            directional_steps = sum(
+                1
+                for delta in step_deltas
+                if delta * direction_sign >= self._minimum_step_delta
+            )
+            if directional_steps < self._minimum_directional_steps:
+                continue
+
+            action = "next" if dx > 0 else "previous"
+            direction = "right" if dx > 0 else "left"
+            candidate = (action, direction, round(dx, 4), round(velocity, 3), abs(dx))
+            if best is None or candidate[4] > best[4]:
+                best = candidate
+
+        if best is None:
+            first_time, first_x, first_y = points[0]
+            last_time, last_x, last_y = points[-1]
+            duration = max(last_time - first_time, 0.001)
+            return None, None, round(last_x - first_x, 4), round(abs(last_x - first_x) / duration, 3)
+
+        action, direction, delta, velocity, _ = best
+        return action, direction, delta, velocity
+
     def _classify_motion(
         self,
         client_id: str,
@@ -491,6 +477,7 @@ class VisionManager:
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         now = time.perf_counter()
         pose_matched = landmark_hand is not None and landmark_hand["pose"] == "page_turn_ready"
+        tracking_hand = motion_hand or landmark_hand or hand
         if pose_matched:
             self._last_pose_matched_at[client_id] = now
         recently_pose_matched = (
@@ -516,7 +503,51 @@ class VisionManager:
         if self._activation_started_at[client_id] > 0.0:
             hold_progress = min(1.0, (now - self._activation_started_at[client_id]) / PAGE_TURN_HOLD_SECONDS)
 
-        if hand is None:
+        direct_hand = landmark_hand if landmark_hand is not None else hand
+        if direct_hand is not None and direct_hand.get("source") == "opencv-motion":
+            direct_hand = None
+        direct_action: Optional[str] = None
+        direct_direction: Optional[str] = None
+        direct_delta: Optional[float] = None
+        direct_velocity: Optional[float] = None
+        if direct_hand is not None:
+            direct_history = self._direct_swipe_histories[client_id]
+            center = direct_hand["center"]
+            direct_history.append((now, center["x"], center["y"]))
+            if cooldown_remaining <= 0:
+                direct_action, direct_direction, direct_delta, direct_velocity = self._detect_swipe_action(
+                    direct_history,
+                    self._direct_swipe_threshold,
+                    self._direct_swipe_min_velocity,
+                    self._direct_swipe_directness,
+                )
+        else:
+            self._direct_swipe_histories[client_id].clear()
+
+        if direct_action is not None and not self._page_turn_armed[client_id]:
+            self._last_action_at[client_id] = now
+            self._activation_started_at[client_id] = 0.0
+            self._last_pose_matched_at[client_id] = 0.0
+            self._direct_swipe_histories[client_id].clear()
+            return {
+                "name": f"quick-swipe-{direct_action}",
+                "action": direct_action,
+                "confidence": direct_hand["confidence"] if direct_hand else 0.75,
+            }, {
+                "pageTurnPoseMatched": hold_pose_active,
+                "pageTurnHoldGrace": recently_pose_matched and not pose_matched,
+                "pageTurnHoldProgress": round(hold_progress, 2),
+                "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
+                "pageTurnArmed": False,
+                "pageTurnTrackingSource": direct_hand.get("source") if direct_hand else None,
+                "pageTurnSwipeDirection": direct_direction,
+                "pageTurnSwipeDelta": direct_delta,
+                "pageTurnSwipeVelocity": direct_velocity,
+                "pageTurnCooldownRemaining": round(self.cooldown_seconds, 2),
+                "pageTurnQuickSwipe": True,
+            }
+
+        if hand is None and not self._page_turn_armed[client_id]:
             self._histories[client_id].clear()
             self._page_turn_armed[client_id] = False
             self._page_turn_armed_at[client_id] = 0.0
@@ -528,6 +559,29 @@ class VisionManager:
                 "pageTurnHoldProgress": 0.0,
                 "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
                 "pageTurnArmed": False,
+                "pageTurnSwipeDirection": None,
+                "pageTurnSwipeDelta": None,
+                "pageTurnSwipeVelocity": None,
+                "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
+            }
+
+        if hand is None:
+            if now - self._page_turn_armed_at[client_id] > self._page_turn_arm_timeout:
+                self._histories[client_id].clear()
+                self._page_turn_armed[client_id] = False
+                self._page_turn_armed_at[client_id] = 0.0
+                self._activation_started_at[client_id] = 0.0
+                self._last_pose_matched_at[client_id] = 0.0
+            return {
+                "name": "page-turn-armed",
+                "action": "open_hand",
+                "confidence": 0.0,
+            }, {
+                "pageTurnPoseMatched": hold_pose_active,
+                "pageTurnHoldGrace": recently_pose_matched and not pose_matched,
+                "pageTurnHoldProgress": round(hold_progress, 2),
+                "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
+                "pageTurnArmed": self._page_turn_armed[client_id],
                 "pageTurnSwipeDirection": None,
                 "pageTurnSwipeDelta": None,
                 "pageTurnSwipeVelocity": None,
@@ -563,7 +617,6 @@ class VisionManager:
                 "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
             }
 
-        tracking_hand = motion_hand or landmark_hand or hand
         if tracking_hand is None:
             self._histories[client_id].clear()
             self._page_turn_armed[client_id] = False
@@ -594,82 +647,20 @@ class VisionManager:
             history.append((now, center["x"], center["y"]))
 
         history = self._histories[client_id]
-        if len(history) >= 4 and cooldown_remaining <= 0:
-            full_history = list(history)
-            full_step_deltas = [
-                full_history[index][1] - full_history[index - 1][1]
-                for index in range(1, len(full_history))
-            ]
-            start_index = next(
-                (
-                    index - 1
-                    for index, delta in enumerate(full_step_deltas, start=1)
-                    if abs(delta) >= self._minimum_start_step_delta
-                ),
-                None,
+        if len(history) >= 2 and cooldown_remaining <= 0:
+            action, swipe_direction, swipe_delta, swipe_velocity = self._detect_swipe_action(
+                history,
+                self.swipe_threshold,
+                self._minimum_swipe_velocity,
+                self._minimum_swipe_directness,
             )
-            candidate = full_history[start_index:] if start_index is not None else []
-            if len(candidate) < 4:
-                first_time, first_x, first_y = full_history[0]
-                last_time, last_x, last_y = full_history[-1]
-                swipe_delta = round(last_x - first_x, 4)
-                swipe_velocity = round(abs(last_x - first_x) / max(last_time - first_time, 0.001), 3)
-                return {
-                    "name": "page-turn-armed",
-                    "action": "open_hand",
-                    "confidence": tracking_hand["confidence"],
-                }, {
-                    "pageTurnPoseMatched": hold_pose_active,
-                    "pageTurnHoldGrace": recently_pose_matched and not pose_matched,
-                    "pageTurnHoldProgress": round(hold_progress, 2),
-                    "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
-                    "pageTurnArmed": self._page_turn_armed[client_id],
-                    "pageTurnSwipeDirection": None,
-                    "pageTurnSwipeDelta": swipe_delta,
-                    "pageTurnSwipeVelocity": swipe_velocity,
-                    "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
-                }
-
-            first_time, first_x, first_y = candidate[0]
-            last_time, last_x, last_y = candidate[-1]
-            dx = last_x - first_x
-            dy = abs(last_y - first_y)
-            duration = max(last_time - first_time, 0.001)
-            step_deltas = [
-                candidate[index][1] - candidate[index - 1][1]
-                for index in range(1, len(candidate))
-            ]
-            horizontal_path = sum(abs(delta) for delta in step_deltas)
-            directness = abs(dx) / max(horizontal_path, 0.001)
-            direction_sign = 1 if dx > 0 else -1
-            directional_steps = sum(
-                1
-                for delta in step_deltas
-                if delta * direction_sign >= self._minimum_step_delta
-            )
-            signed_steps = [delta * direction_sign for delta in step_deltas]
-            start_step = signed_steps[0] if signed_steps else 0.0
-            peak_step = max(signed_steps) if signed_steps else 0.0
-            swipe_delta = round(dx, 4)
-            swipe_velocity = round(abs(dx) / duration, 3)
-
-            if (
-                self._minimum_swipe_duration <= duration <= self._maximum_swipe_duration
-                and abs(dx) > self.swipe_threshold
-                and dy < self._maximum_vertical_drift
-                and abs(dx) / duration >= self._minimum_swipe_velocity
-                and start_step >= self._minimum_start_step_delta
-                and peak_step >= self._minimum_peak_step_delta
-                and directness >= self._minimum_swipe_directness
-                and directional_steps >= self._minimum_directional_steps
-            ):
-                swipe_direction = "right" if dx > 0 else "left"
-                action = "next" if dx > 0 else "previous"
+            if action is not None:
                 self._last_action_at[client_id] = now
                 self._page_turn_armed[client_id] = False
                 self._page_turn_armed_at[client_id] = 0.0
                 self._activation_started_at[client_id] = 0.0
                 history.clear()
+                self._direct_swipe_histories[client_id].clear()
 
         return {
             "name": f"page-turn-{action}" if action else "page-turn-armed",
@@ -730,7 +721,7 @@ class VisionManager:
 
     def update_settings(self, settings: VisionSettingsPayload) -> Dict[str, float]:
         if settings.cooldownSeconds is not None:
-            self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
+            self.cooldown_seconds = min(10.0, max(0.5, settings.cooldownSeconds))
         if settings.swipeThreshold is not None:
             self.swipe_threshold = min(0.5, max(0.005, settings.swipeThreshold))
         if settings.confidenceThreshold is not None:
@@ -757,7 +748,6 @@ app.mount("/media", StaticFiles(directory=STORAGE_DIR), name="media")
 
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 vision_manager = VisionManager()
-voice_transcriber = VoiceTranscriber()
 
 
 class PresentationController:
@@ -1437,29 +1427,18 @@ async def recognise_voice(payload: VoiceRecognitionPayload) -> Dict[str, Any]:
 
 
 @app.post("/api/voice/transcribe")
-async def transcribe_voice(payload: VoiceAudioPayload) -> Dict[str, Any]:
-    audio = _decode_frame(payload.data)
-    if audio is None:
-        raise HTTPException(status_code=400, detail="音频数据格式无效")
-
-    transcription = await run_in_threadpool(voice_transcriber.transcribe_wav, audio)
-    if transcription["error"]:
-        raise HTTPException(status_code=500, detail=f"本地语音识别失败：{transcription['error']}")
-
-    command_result = recognise_voice_command(
-        VoiceRecognitionPayload(
-            text=transcription["text"],
-            isFinal=True,
-            showEndConfirm=payload.showEndConfirm,
-        )
-    )
+async def transcribe_voice_compat(request: Request) -> Dict[str, Any]:
+    await request.body()
     return {
-        **command_result,
-        "text": transcription["text"],
-        "transcript": transcription["text"],
-        "engine": "vosk",
-        "model": transcription["model"],
-        "sampleRate": transcription["sampleRate"],
+        "matched": False,
+        "action": None,
+        "label": None,
+        "score": 0.0,
+        "isFinal": True,
+        "text": "",
+        "transcript": "",
+        "engine": "browser-speech-compat",
+        "candidates": [],
     }
 
 

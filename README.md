@@ -10,7 +10,7 @@ AirSlide 是一个面向课堂汇报和演讲场景的智能演讲辅助 Web 应
 - 前端摄像头取帧，发送到 Python 后端进行 OpenCV 视觉分析
 - 手势滑动触发翻页，带冷却时间和触发阈值，降低误操作
 - 空气指针、标注、区域放大模式
-- 本地离线语音识别控制：下一页、上一页、指针、标注、放大、暂停、继续、结束演示
+- 浏览器实时语音识别控制：下一页、上一页、指针、标注、放大、暂停、继续、结束演示
 - 交互设置面板：冷却时间、滑动阈值、置信阈值、外部 PowerPoint 控制开关
 - 可选外部 PowerPoint 控制：Python 优先尝试 PowerPoint COM，失败时使用系统按键兜底
 
@@ -30,7 +30,7 @@ python -m uvicorn main:socket_app --reload --host 127.0.0.1 --port 8000
 
 在 Windows 且安装了 PowerPoint 时，后端会优先调用 PowerPoint 导出高清图片；如果导出不可用，会从 `.pptx` 中提取文字生成预览页，保证放映流程可以跑通。
 
-语音识别使用本地 Vosk 模型，默认读取 `airslide-backend/models/vosk-model-small-cn-0.22`。模型目录较大，不提交到仓库。
+语音识别使用浏览器 `SpeechRecognition` / `webkitSpeechRecognition` 获取实时候选文本，再由后端轻量匹配演示命令；无需额外下载本地语音模型。
 
 ## 运行前端
 
