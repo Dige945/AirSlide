@@ -147,6 +147,21 @@ type CommandAction =
   | 'clear-annotations'
 type VoiceAction = CommandAction | 'cancel-end'
 
+type SpeechRecognitionLike = {
+  lang: string
+  continuous: boolean
+  interimResults: boolean
+  maxAlternatives?: number
+  onresult: ((event: any) => void) | null
+  onend: (() => void) | null
+  onerror: ((event: any) => void) | null
+  onaudiostart?: (() => void) | null
+  onspeechstart?: (() => void) | null
+  onspeechend?: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+
 type VoiceCommandPattern = {
   action: VoiceAction
   label: string
@@ -182,6 +197,13 @@ type BackendVoiceMatch = {
     confidence: number
     score: number
   }>
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition?: new () => SpeechRecognitionLike
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike
+  }
 }
 
 type ExternalControlResult = {
@@ -229,7 +251,7 @@ const drawingLine = ref<AnnotationLine | null>(null)
 const voiceEnabled = ref(false)
 const voiceSupported = ref(true)
 const lastVoiceText = ref('等待语音')
-const lastVoiceError = ref('')
+const speechRecognition = ref<SpeechRecognitionLike | null>(null)
 const showEndConfirm = ref(false)
 const pendingEndByVoice = ref(false)
 const showSettings = ref(false)
@@ -257,17 +279,10 @@ let annotationId = 0
 let lastCommandAt = 0
 let lastVoiceAction = ''
 let lastVoiceActionAt = 0
+let ignoreVoiceEndRestart = false
 let voiceRequestSerial = 0
 let visionRequestInFlight = false
 let lastFaceDetectedAt = 0
-let voiceStream: MediaStream | null = null
-let voiceAudioContext: AudioContext | null = null
-let voiceProcessor: ScriptProcessorNode | null = null
-let voiceSource: MediaStreamAudioSourceNode | null = null
-let voiceChunks: Float32Array[] = []
-let voiceChunkSampleCount = 0
-let voiceFlushTimerId: number | undefined
-let voiceRequestInFlight = false
 let fullscreenChromeTimerId: number | undefined
 
 function clamp(value: number, min: number, max: number) {
@@ -635,7 +650,7 @@ const gestureText = computed(() => {
 const voiceText = computed(() => {
   if (!voiceSupported.value) return '语音：浏览器不支持'
   if (!voiceEnabled.value) return '语音：点击麦克风开启'
-  return `语音：${lastVoiceText.value}${lastVoiceError.value ? ` (${lastVoiceError.value})` : ''}`
+  return `语音：${lastVoiceText.value}`
 })
 const latencyText = computed(() => {
   if (recognitionPaused.value) return '识别已暂停'
@@ -1073,7 +1088,7 @@ function executeCommand(action: CommandAction, source: CommandSource = 'button')
     fullscreenChromeVisible.value = true
   }
 
-  const commandCooldownMs = source === 'gesture' ? 5000 : source === 'voice' ? 620 : 950
+  const commandCooldownMs = source === 'gesture' ? visionSettings.value.cooldownSeconds * 1000 : source === 'voice' ? 620 : 950
   if (needsCooldown && now - lastCommandAt < commandCooldownMs) return
   if (needsCooldown) lastCommandAt = now
 
@@ -1191,7 +1206,7 @@ function startVisionLoop() {
   visionStatus.value = '视觉识别中'
   visionTimerId = window.setInterval(() => {
     void captureVisionFrame()
-  }, 90)
+  }, 65)
 }
 
 function stopVisionLoop() {
@@ -1243,14 +1258,14 @@ async function captureVisionFrame() {
   const context = canvas.getContext('2d')
   if (!context) return
 
-  canvas.width = 360
-  canvas.height = 202
+  canvas.width = 480
+  canvas.height = 270
   context.save()
   context.scale(-1, 1)
   context.drawImage(videoRef.value, -canvas.width, 0, canvas.width, canvas.height)
   context.restore()
 
-  const data = canvas.toDataURL('image/jpeg', 0.58)
+  const data = canvas.toDataURL('image/jpeg', 0.72)
   const startedAt = performance.now()
   visionRequestInFlight = true
   try {
@@ -1483,166 +1498,74 @@ watch(
   },
 )
 
-function encodeWav(samples: Float32Array, sampleRate: number) {
-  const buffer = new ArrayBuffer(44 + samples.length * 2)
-  const view = new DataView(buffer)
-  writeAscii(view, 0, 'RIFF')
-  view.setUint32(4, 36 + samples.length * 2, true)
-  writeAscii(view, 8, 'WAVE')
-  writeAscii(view, 12, 'fmt ')
-  view.setUint32(16, 16, true)
-  view.setUint16(20, 1, true)
-  view.setUint16(22, 1, true)
-  view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * 2, true)
-  view.setUint16(32, 2, true)
-  view.setUint16(34, 16, true)
-  writeAscii(view, 36, 'data')
-  view.setUint32(40, samples.length * 2, true)
-
-  let offset = 44
-  for (let index = 0; index < samples.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, samples[index]))
-    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
-    offset += 2
+function startVoice() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+  if (!Recognition) {
+    voiceSupported.value = false
+    lastVoiceText.value = '浏览器不支持语音识别'
+    return
   }
-  return new Blob([buffer], { type: 'audio/wav' })
-}
 
-function writeAscii(view: DataView, offset: number, text: string) {
-  for (let index = 0; index < text.length; index += 1) {
-    view.setUint8(offset + index, text.charCodeAt(index))
+  const recognition = new Recognition()
+  recognition.lang = 'zh-CN'
+  recognition.continuous = true
+  recognition.interimResults = true
+  recognition.maxAlternatives = 3
+  recognition.onresult = (event: any) => {
+    void handleVoiceCandidates(collectVoiceCandidates(event))
   }
-}
-
-function resampleTo16k(input: Float32Array, sourceRate: number) {
-  const targetRate = 16000
-  if (sourceRate === targetRate) return input
-  const ratio = sourceRate / targetRate
-  const length = Math.max(1, Math.round(input.length / ratio))
-  const output = new Float32Array(length)
-  for (let index = 0; index < length; index += 1) {
-    const sourceIndex = index * ratio
-    const before = Math.floor(sourceIndex)
-    const after = Math.min(before + 1, input.length - 1)
-    const weight = sourceIndex - before
-    output[index] = input[before] * (1 - weight) + input[after] * weight
+  recognition.onaudiostart = () => {
+    lastVoiceText.value = '正在聆听'
   }
-  return output
-}
-
-function mergeVoiceChunks(chunks: Float32Array[], length: number) {
-  const merged = new Float32Array(length)
-  let offset = 0
-  for (const chunk of chunks) {
-    merged.set(chunk, offset)
-    offset += chunk.length
+  recognition.onspeechstart = () => {
+    lastVoiceText.value = '识别中'
   }
-  return merged
-}
-
-function blobToDataUrl(blob: Blob) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result))
-    reader.onerror = () => reject(reader.error)
-    reader.readAsDataURL(blob)
-  })
-}
-
-async function transcribeVoiceChunk(samples: Float32Array, sourceRate: number) {
-  if (voiceRequestInFlight || samples.length < sourceRate * 0.45) return
-  voiceRequestInFlight = true
-  try {
-    const wav = encodeWav(resampleTo16k(samples, sourceRate), 16000)
-    const data = await blobToDataUrl(wav)
-    const response = await fetch(`${apiBase}/api/voice/transcribe`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data, showEndConfirm: showEndConfirm.value }),
-    })
-    if (!response.ok) throw new Error(await response.text())
-    const match = (await response.json()) as BackendVoiceMatch & { transcript?: string }
-    lastVoiceError.value = ''
-    if (match.transcript) {
-      lastVoiceText.value = match.matched ? match.label ?? match.transcript : match.transcript
-    } else {
+  recognition.onspeechend = () => {
+    if (voiceEnabled.value) lastVoiceText.value = '正在判断'
+  }
+  recognition.onerror = (event: any) => {
+    const error = String(event?.error ?? '')
+    if (error === 'no-speech') {
       lastVoiceText.value = '正在聆听'
+      return
     }
-    if (match.matched) runBackendVoiceAction(match)
-  } catch (exc) {
-    lastVoiceError.value = exc instanceof Error ? exc.message.slice(0, 60) : 'transcribe-failed'
-    lastVoiceText.value = '本地语音识别失败'
-  } finally {
-    voiceRequestInFlight = false
+    if (error === 'not-allowed' || error === 'service-not-allowed') {
+      voiceEnabled.value = false
+      lastVoiceText.value = '麦克风权限受限'
+      return
+    }
+    lastVoiceText.value = '语音识别异常'
   }
-}
+  recognition.onend = () => {
+    if (voiceEnabled.value && !ignoreVoiceEndRestart) {
+      try {
+        recognition.start()
+      } catch {
+        voiceEnabled.value = false
+      }
+    }
+  }
 
-function flushVoiceChunk() {
-  if (!voiceAudioContext || !voiceChunks.length) return
-  const chunks = voiceChunks
-  const length = voiceChunkSampleCount
-  const sampleRate = voiceAudioContext.sampleRate
-  voiceChunks = []
-  voiceChunkSampleCount = 0
-  void transcribeVoiceChunk(mergeVoiceChunks(chunks, length), sampleRate)
-}
-
-async function startVoice() {
-  lastVoiceError.value = ''
+  speechRecognition.value = recognition
+  voiceEnabled.value = true
+  voiceSupported.value = true
+  ignoreVoiceEndRestart = false
   lastVoiceText.value = '正在聆听'
   try {
-    voiceStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
-    })
-    voiceAudioContext = new AudioContext()
-    voiceSource = voiceAudioContext.createMediaStreamSource(voiceStream)
-    voiceProcessor = voiceAudioContext.createScriptProcessor(4096, 1, 1)
-    voiceProcessor.onaudioprocess = (event) => {
-      if (!voiceEnabled.value) return
-      const input = event.inputBuffer.getChannelData(0)
-      voiceChunks.push(new Float32Array(input))
-      voiceChunkSampleCount += input.length
-    }
-    voiceSource.connect(voiceProcessor)
-    voiceProcessor.connect(voiceAudioContext.destination)
-    voiceFlushTimerId = window.setInterval(flushVoiceChunk, 1800)
-    voiceEnabled.value = true
-    voiceSupported.value = true
-  } catch (exc) {
+    recognition.start()
+  } catch {
     voiceEnabled.value = false
-    lastVoiceError.value = exc instanceof Error ? exc.name : 'start-failed'
-    lastVoiceText.value = '麦克风启动失败'
+    lastVoiceText.value = '语音启动失败'
   }
 }
 
 function stopVoice() {
+  ignoreVoiceEndRestart = true
   voiceEnabled.value = false
-  if (voiceFlushTimerId !== undefined) {
-    window.clearInterval(voiceFlushTimerId)
-    voiceFlushTimerId = undefined
-  }
-  flushVoiceChunk()
-  voiceProcessor?.disconnect()
-  voiceSource?.disconnect()
-  void voiceAudioContext?.close()
-  voiceStream?.getTracks().forEach((track) => track.stop())
-  voiceProcessor = null
-  voiceSource = null
-  voiceAudioContext = null
-  voiceStream = null
-  voiceChunks = []
-  voiceChunkSampleCount = 0
-  voiceRequestInFlight = false
+  speechRecognition.value?.stop()
+  speechRecognition.value = null
   lastVoiceAction = ''
   lastVoiceActionAt = 0
-  lastVoiceError.value = ''
   lastVoiceText.value = '等待语音'
 }
 
@@ -2288,9 +2211,9 @@ onBeforeUnmount(() => {
         <label class="setting-row">
           <span>
             手势冷却时间
-            <small>翻页手势固定 5 秒冷却，防止连续误触发</small>
+            <small>数值越小响应越快，越大越能避免连续误触发</small>
           </span>
-          <input v-model.number="visionSettings.cooldownSeconds" min="5" max="5" step="0.1" type="range" disabled />
+          <input v-model.number="visionSettings.cooldownSeconds" min="0.5" max="10" step="0.1" type="range" />
           <b>{{ visionSettings.cooldownSeconds.toFixed(1) }}s</b>
         </label>
 
