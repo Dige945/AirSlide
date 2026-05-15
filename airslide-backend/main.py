@@ -94,9 +94,6 @@ class VisionManager:
         self._histories: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(
             lambda: deque(maxlen=12)
         )
-        self._direct_swipe_histories: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(
-            lambda: deque(maxlen=8)
-        )
         self._previous_frames: Dict[str, Any] = {}
         self._last_action_at: Dict[str, float] = defaultdict(float)
         self._activation_started_at: Dict[str, float] = defaultdict(float)
@@ -105,22 +102,20 @@ class VisionManager:
         self._page_turn_armed_at: Dict[str, float] = defaultdict(float)
         self._opencv_error: Optional[str] = None
         self._mediapipe_error: Optional[str] = None
+        self._mediapipe_face_error: Optional[str] = None
         self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
-        self.swipe_threshold = 0.045
+        self.swipe_threshold = 0.10
         self.confidence_threshold = 0.45
-        self._minimum_swipe_duration = 0.05
-        self._maximum_swipe_duration = 2.6
-        self._maximum_vertical_drift = 0.45
-        self._minimum_swipe_velocity = 0.018
-        self._minimum_step_delta = 0.0008
-        self._minimum_directional_steps = 1
-        self._minimum_swipe_directness = 0.18
-        self._direct_swipe_threshold = 0.12
-        self._direct_swipe_min_velocity = 0.14
-        self._direct_swipe_directness = 0.34
-        self._page_turn_settle_seconds = 0.0
-        self._page_turn_hold_grace_seconds = 1.0
-        self._page_turn_arm_timeout = 5.0
+        self._minimum_swipe_duration = 0.12
+        self._maximum_swipe_duration = 2.4
+        self._maximum_vertical_drift = 0.32
+        self._minimum_swipe_velocity = 0.045
+        self._minimum_step_delta = 0.0025
+        self._minimum_directional_steps = 2
+        self._minimum_swipe_directness = 0.45
+        self._page_turn_settle_seconds = 0.08
+        self._page_turn_hold_grace_seconds = 0.35
+        self._page_turn_arm_timeout = 3.0
 
         try:
             import cv2
@@ -179,9 +174,22 @@ class VisionManager:
                 min_detection_confidence=0.45,
                 min_tracking_confidence=0.45,
             )
+
+            try:
+                self.mp_face_detection = mp_solutions.face_detection
+                self.face_detection = self.mp_face_detection.FaceDetection(
+                    model_selection=0,
+                    min_detection_confidence=0.45,
+                )
+            except Exception as face_exc:
+                self.mp_face_detection = None
+                self.face_detection = None
+                self._mediapipe_face_error = str(face_exc)
         except Exception as exc:
             self.mp_hands = None
             self.hands = None
+            self.mp_face_detection = None
+            self.face_detection = None
             self._mediapipe_error = str(exc)
 
     def _empty_result(self, started_at: float, status: str = "no-signal") -> VisionResult:
@@ -204,12 +212,70 @@ class VisionManager:
         return image
 
     def _detect_face(self, image: Any) -> Optional[Dict[str, Any]]:
+        mediapipe_face = self._detect_mediapipe_face(image)
+        if mediapipe_face is not None:
+            return mediapipe_face
+
+        return self._detect_opencv_face(image)
+
+    def _detect_mediapipe_face(self, image: Any) -> Optional[Dict[str, Any]]:
+        if self.cv2 is None or self.face_detection is None:
+            return None
+
+        height, width = image.shape[:2]
+        rgb = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        result = self.face_detection.process(rgb)
+        detections = result.detections if result and result.detections else []
+        if not detections:
+            return None
+
+        detection = max(
+            detections,
+            key=lambda item: (
+                item.location_data.relative_bounding_box.width
+                * item.location_data.relative_bounding_box.height
+            ),
+        )
+        relative_box = detection.location_data.relative_bounding_box
+        x = max(0.0, relative_box.xmin)
+        y = max(0.0, relative_box.ymin)
+        box_width = min(1.0 - x, max(0.01, relative_box.width))
+        box_height = min(1.0 - y, max(0.01, relative_box.height))
+        confidence = detection.score[0] if detection.score else 0.78
+        face_width_ratio = max(box_width, 0.01)
+        distance_meters = max(0.7, min(4.8, 0.55 / face_width_ratio))
+
+        return {
+            "box": {
+                "x": round(x, 4),
+                "y": round(y, 4),
+                "width": round(box_width, 4),
+                "height": round(box_height, 4),
+            },
+            "center": {
+                "x": round(x + box_width / 2, 4),
+                "y": round(y + box_height / 2, 4),
+            },
+            "confidence": round(max(0.45, min(0.99, confidence)), 2),
+            "distanceMeters": round(distance_meters, 1),
+            "source": "mediapipe-face",
+        }
+
+    def _detect_opencv_face(self, image: Any) -> Optional[Dict[str, Any]]:
         if self.cv2 is None or self.face_cascade is None or self.face_cascade.empty():
             return None
 
         height, width = image.shape[:2]
         gray = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4)
+        gray = self.cv2.equalizeHist(gray)
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.08,
+            minNeighbors=3,
+            minSize=(36, 36),
+            flags=self.cv2.CASCADE_SCALE_IMAGE,
+        )
         if len(faces) == 0:
             return None
 
@@ -228,8 +294,9 @@ class VisionManager:
                 "x": round((x + w / 2) / width, 4),
                 "y": round((y + h / 2) / height, 4),
             },
-            "confidence": 0.86,
+            "confidence": 0.74,
             "distanceMeters": round(distance_meters, 1),
+            "source": "opencv-haar",
         }
 
     def _detect_hand(self, image: Any, face: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -503,50 +570,6 @@ class VisionManager:
         if self._activation_started_at[client_id] > 0.0:
             hold_progress = min(1.0, (now - self._activation_started_at[client_id]) / PAGE_TURN_HOLD_SECONDS)
 
-        direct_hand = landmark_hand if landmark_hand is not None else hand
-        if direct_hand is not None and direct_hand.get("source") == "opencv-motion":
-            direct_hand = None
-        direct_action: Optional[str] = None
-        direct_direction: Optional[str] = None
-        direct_delta: Optional[float] = None
-        direct_velocity: Optional[float] = None
-        if direct_hand is not None:
-            direct_history = self._direct_swipe_histories[client_id]
-            center = direct_hand["center"]
-            direct_history.append((now, center["x"], center["y"]))
-            if cooldown_remaining <= 0:
-                direct_action, direct_direction, direct_delta, direct_velocity = self._detect_swipe_action(
-                    direct_history,
-                    self._direct_swipe_threshold,
-                    self._direct_swipe_min_velocity,
-                    self._direct_swipe_directness,
-                )
-        else:
-            self._direct_swipe_histories[client_id].clear()
-
-        if direct_action is not None and not self._page_turn_armed[client_id]:
-            self._last_action_at[client_id] = now
-            self._activation_started_at[client_id] = 0.0
-            self._last_pose_matched_at[client_id] = 0.0
-            self._direct_swipe_histories[client_id].clear()
-            return {
-                "name": f"quick-swipe-{direct_action}",
-                "action": direct_action,
-                "confidence": direct_hand["confidence"] if direct_hand else 0.75,
-            }, {
-                "pageTurnPoseMatched": hold_pose_active,
-                "pageTurnHoldGrace": recently_pose_matched and not pose_matched,
-                "pageTurnHoldProgress": round(hold_progress, 2),
-                "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
-                "pageTurnArmed": False,
-                "pageTurnTrackingSource": direct_hand.get("source") if direct_hand else None,
-                "pageTurnSwipeDirection": direct_direction,
-                "pageTurnSwipeDelta": direct_delta,
-                "pageTurnSwipeVelocity": direct_velocity,
-                "pageTurnCooldownRemaining": round(self.cooldown_seconds, 2),
-                "pageTurnQuickSwipe": True,
-            }
-
         if hand is None and not self._page_turn_armed[client_id]:
             self._histories[client_id].clear()
             self._page_turn_armed[client_id] = False
@@ -593,6 +616,13 @@ class VisionManager:
             and self._page_turn_armed_at[client_id] > 0.0
             and now - self._page_turn_armed_at[client_id] > self._page_turn_arm_timeout
         ):
+            self._page_turn_armed[client_id] = False
+            self._page_turn_armed_at[client_id] = 0.0
+            self._activation_started_at[client_id] = 0.0
+            self._last_pose_matched_at[client_id] = 0.0
+            self._histories[client_id].clear()
+
+        if self._page_turn_armed[client_id] and not hold_pose_active:
             self._page_turn_armed[client_id] = False
             self._page_turn_armed_at[client_id] = 0.0
             self._activation_started_at[client_id] = 0.0
@@ -660,7 +690,6 @@ class VisionManager:
                 self._page_turn_armed_at[client_id] = 0.0
                 self._activation_started_at[client_id] = 0.0
                 history.clear()
-                self._direct_swipe_histories[client_id].clear()
 
         return {
             "name": f"page-turn-{action}" if action else "page-turn-armed",
@@ -689,8 +718,8 @@ class VisionManager:
             if image is None:
                 return self._empty_result(started_at, "opencv-unavailable")
 
-            face = self._detect_face(image)
             landmark_hand = self._detect_landmark_hand(image)
+            face = self._detect_face(image)
             skin_hand = self._detect_hand(image, face)
             motion_hand = self._detect_motion_hand(client_id, image, face)
             if landmark_hand is not None:
@@ -704,6 +733,8 @@ class VisionManager:
             debug = {
                 "mediapipeAvailable": self.hands is not None,
                 "mediapipeError": self._mediapipe_error,
+                "faceDetectionAvailable": self.face_detection is not None,
+                "faceDetectionError": self._mediapipe_face_error,
                 "opencvAvailable": self.cv2 is not None,
                 "opencvError": self._opencv_error,
                 "handSource": hand.get("source") if hand else None,

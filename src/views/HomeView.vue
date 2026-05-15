@@ -90,6 +90,7 @@ type VisionResult = {
     center: Point
     confidence: number
     distanceMeters: number
+    source?: string
   } | null
   hand?: {
     center: Point
@@ -107,6 +108,8 @@ type VisionResult = {
   debug?: {
     mediapipeAvailable?: boolean
     mediapipeError?: string | null
+    faceDetectionAvailable?: boolean
+    faceDetectionError?: string | null
     opencvAvailable?: boolean
     opencvError?: string | null
     handSource?: string | null
@@ -223,6 +226,7 @@ const videoRef = ref<HTMLVideoElement | null>(null)
 const previewCanvasRef = ref<HTMLCanvasElement | null>(null)
 const debugVideoRef = ref<HTMLVideoElement | null>(null)
 const frameCanvasRef = ref<HTMLCanvasElement | null>(null)
+const zoomWindowRef = ref<HTMLElement | null>(null)
 const cameraStream = ref<MediaStream | null>(null)
 const deck = ref<PresentationManifest | null>(null)
 const pendingDeck = ref<PresentationManifest | null>(null)
@@ -245,7 +249,9 @@ const trackedFaceZoom = ref(1.04)
 const trackedFaceSize = ref(0.24)
 const visionStatus = ref('视觉待机')
 const pointerPosition = ref<Point>({ x: 0.72, y: 0.58 })
+const targetPointerPosition = ref<Point>({ x: 0.72, y: 0.58 })
 const zoomPoint = ref<Point>({ x: 0.72, y: 0.55 })
+const targetZoomPoint = ref<Point>({ x: 0.72, y: 0.55 })
 const annotations = ref<AnnotationLine[]>([])
 const drawingLine = ref<AnnotationLine | null>(null)
 const voiceEnabled = ref(false)
@@ -271,10 +277,12 @@ const visionSettings = ref<VisionSettings>({
   confidenceThreshold: 0.45,
 })
 const eraserRadius = 0.022
+const zoomMagnification = 2.2
 
 let timerId: number | undefined
 let visionTimerId: number | undefined
 let previewFrameId: number | undefined
+let pointerFrameId: number | undefined
 let annotationId = 0
 let lastCommandAt = 0
 let lastVoiceAction = ''
@@ -679,8 +687,39 @@ const zoomWindowStyle = computed(() => ({
 const zoomImageStyle = computed(() => {
   if (!currentSlide.value) return {}
 
+  const stageRect = stageRef.value?.getBoundingClientRect()
+  const zoomRect = zoomWindowRef.value?.getBoundingClientRect()
+  if (stageRect && zoomRect) {
+    const slideAspect = currentSlide.value.width / currentSlide.value.height
+    const stageAspect = stageRect.width / stageRect.height
+    let slideWidth = stageRect.width
+    let slideHeight = stageRect.height
+    let slideOffsetX = 0
+    let slideOffsetY = 0
+
+    if (stageAspect > slideAspect) {
+      slideHeight = stageRect.height
+      slideWidth = slideHeight * slideAspect
+      slideOffsetX = (stageRect.width - slideWidth) / 2
+    } else {
+      slideWidth = stageRect.width
+      slideHeight = slideWidth / slideAspect
+      slideOffsetY = (stageRect.height - slideHeight) / 2
+    }
+
+    const localX = clamp(zoomPoint.value.x * stageRect.width - slideOffsetX, 0, slideWidth)
+    const localY = clamp(zoomPoint.value.y * stageRect.height - slideOffsetY, 0, slideHeight)
+
+    return {
+      backgroundImage: `url(${slideUrl(currentSlide.value)})`,
+      backgroundSize: `${slideWidth * zoomMagnification}px ${slideHeight * zoomMagnification}px`,
+      backgroundPosition: `${zoomRect.width / 2 - localX * zoomMagnification}px ${zoomRect.height / 2 - localY * zoomMagnification}px`,
+    }
+  }
+
   return {
     backgroundImage: `url(${slideUrl(currentSlide.value)})`,
+    backgroundSize: `${zoomMagnification * 100}% ${zoomMagnification * 100}%`,
     backgroundPosition: `${zoomPoint.value.x * 100}% ${zoomPoint.value.y * 100}%`,
   }
 })
@@ -1221,6 +1260,10 @@ function stopVisionLoop() {
   trackedFaceCenter.value = { x: 0.5, y: 0.5 }
   trackedFaceZoom.value = 1.04
   trackedFaceSize.value = 0.24
+  targetPointerPosition.value = { x: 0.72, y: 0.58 }
+  pointerPosition.value = { x: 0.72, y: 0.58 }
+  targetZoomPoint.value = { x: 0.72, y: 0.55 }
+  zoomPoint.value = { x: 0.72, y: 0.55 }
 }
 
 async function loadVisionSettings() {
@@ -1292,8 +1335,11 @@ function applyVisionResult(payload: VisionResult) {
   visionStatus.value = payload.status === 'detected' ? '视觉识别中' : '未检测到有效手势'
 
   if (payload.hand?.center) {
-    pointerPosition.value = payload.hand.center
-    zoomPoint.value = payload.hand.center
+    const handCenter = {
+      x: clamp(payload.hand.center.x, 0.02, 0.98),
+      y: clamp(payload.hand.center.y, 0.02, 0.98),
+    }
+    targetPointerPosition.value = handCenter
   }
 
   const action = payload.gesture?.action
@@ -1591,7 +1637,34 @@ function handleStagePointerMove(event: PointerEvent) {
     revealFullscreenChrome()
   }
   if (activeMode.value === 'zoom') {
-    zoomPoint.value = stagePoint(event)
+    const point = stagePoint(event)
+    targetZoomPoint.value = point
+    zoomPoint.value = point
+  }
+}
+
+function startPointerSmoothingLoop() {
+  stopPointerSmoothingLoop()
+
+  const step = () => {
+    pointerPosition.value = {
+      x: blend(pointerPosition.value.x, targetPointerPosition.value.x, 0.24),
+      y: blend(pointerPosition.value.y, targetPointerPosition.value.y, 0.24),
+    }
+    zoomPoint.value = {
+      x: blend(zoomPoint.value.x, targetZoomPoint.value.x, 0.2),
+      y: blend(zoomPoint.value.y, targetZoomPoint.value.y, 0.2),
+    }
+    pointerFrameId = window.requestAnimationFrame(step)
+  }
+
+  pointerFrameId = window.requestAnimationFrame(step)
+}
+
+function stopPointerSmoothingLoop() {
+  if (pointerFrameId !== undefined) {
+    window.cancelAnimationFrame(pointerFrameId)
+    pointerFrameId = undefined
   }
 }
 
@@ -1737,6 +1810,7 @@ function handleKeydown(event: KeyboardEvent) {
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
   document.addEventListener('fullscreenchange', handleFullscreenChange)
+  startPointerSmoothingLoop()
   void loadVisionSettings()
   void loadExternalControlStatus()
   timerId = window.setInterval(() => {
@@ -1749,6 +1823,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   if (timerId) window.clearInterval(timerId)
   clearFullscreenChromeTimer()
+  stopPointerSmoothingLoop()
   stopPreviewLoop()
   stopVoice()
   stopCamera()
@@ -2023,7 +2098,7 @@ onBeforeUnmount(() => {
           <span></span>
         </div>
 
-        <div v-if="activeMode === 'zoom'" class="zoom-window" :style="zoomWindowStyle">
+        <div v-if="activeMode === 'zoom'" ref="zoomWindowRef" class="zoom-window" :style="zoomWindowStyle">
           <div class="zoom-surface" :style="zoomImageStyle">
             <span v-if="!currentSlide">区域放大</span>
           </div>
@@ -2718,11 +2793,8 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   place-items: center;
-  background:
-    linear-gradient(rgb(255 255 255 / 0.08), rgb(255 255 255 / 0.08)),
-    radial-gradient(circle at 50% 50%, #ffffff, #ddecff);
+  background-color: white;
   background-repeat: no-repeat;
-  background-size: 230% 230%;
   color: #1e67d8;
   font-weight: 800;
 }
